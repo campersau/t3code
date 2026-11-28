@@ -143,7 +143,9 @@ describe("mobile connection storage", () => {
 
       if (appLockEnabled === true) await expect(loadPreferences()).resolves.toEqual(legacy);
       else
-        await expect(loadPreferences()).rejects.toMatchObject({ _tag: "MobilePreferencesLoadError" });
+        await expect(loadPreferences()).rejects.toMatchObject({
+          _tag: "MobilePreferencesLoadError",
+        });
     },
   );
 
@@ -190,6 +192,21 @@ describe("mobile connection storage", () => {
     await expect(savePreferencesPatch({ baseFontSize: 19 })).rejects.toMatchObject({
       _tag: "MobilePreferencesSaveError",
     });
+  });
+
+  it.each([
+    ["{invalid", JSON.stringify({ payload: '{"appLockEnabled":false}', updatedAt: 1 })],
+    ['{"appLockEnabled":false}', "{invalid"],
+    ['{"appLockEnabled":false}', JSON.stringify({ payload: "{invalid", updatedAt: 3 })],
+  ])("keeps corrupt preference copies %s and %s untouched", async (stored, fallback) => {
+    mocks.setPreferencesJson(stored, 2);
+    await mocks.setItemAsync("t3code.preferences.fallback", fallback);
+    await expect(loadPreferences()).rejects.toMatchObject({ _tag: "MobilePreferencesLoadError" });
+    await expect(savePreferencesPatch({ baseFontSize: 19 })).rejects.toMatchObject({
+      _tag: "MobilePreferencesSaveError",
+    });
+    expect(mocks.getPreferencesJson()).toBe(stored);
+    expect(mocks.getStoredValue("t3code.preferences.fallback")).toBe(fallback);
   });
 
   it("discards malformed saved PR and issue views without discarding other preferences", async () => {

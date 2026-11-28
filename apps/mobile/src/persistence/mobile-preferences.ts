@@ -599,6 +599,15 @@ const make = Effect.fn("MobilePreferencesStore.make")(function* () {
     const storedPreferences = Option.isSome(storedJson)
       ? parsePayload(storedJson.value.payload)
       : null;
+    // A corrupt copy can be newer, so do not promote or delete either copy yet.
+    if (
+      (Option.isSome(storedJson) &&
+        storedJson.value.payload.trim() !== "" &&
+        storedPreferences === null) ||
+      (Boolean(fallbackJson?.trim()) && fallback === null)
+    ) {
+      return { preferences: {}, unreadable: true };
+    }
     const fallbackIsNewer =
       fallback !== null &&
       (storedPreferences === null ||
