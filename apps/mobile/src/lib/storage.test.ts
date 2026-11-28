@@ -134,12 +134,18 @@ describe("mobile connection storage", () => {
     });
   });
 
-  it("loads legacy preferences when SQLite is unavailable", async () => {
-    mocks.setDatabaseFailures(true, true);
-    await mocks.setItemAsync("t3code.preferences", JSON.stringify({ baseFontSize: 17 }));
+  it.each([true, false, undefined])(
+    "checks a legacy lock value of %s when SQLite is unreadable",
+    async (appLockEnabled) => {
+      mocks.setDatabaseFailures(true, true);
+      const legacy = { baseFontSize: 17, appLockEnabled };
+      await mocks.setItemAsync("t3code.preferences", JSON.stringify(legacy));
 
-    await expect(loadPreferences()).resolves.toEqual({ baseFontSize: 17 });
-  });
+      if (appLockEnabled === true) await expect(loadPreferences()).resolves.toEqual(legacy);
+      else
+        await expect(loadPreferences()).rejects.toMatchObject({ _tag: "MobilePreferencesLoadError" });
+    },
+  );
 
   it("preserves the lock when SQLite fails to read or save preferences", async () => {
     mocks.setPreferencesJson(JSON.stringify({ appLockEnabled: true }), 1);
@@ -161,6 +167,29 @@ describe("mobile connection storage", () => {
     expect(fallback.updatedAt).toEqual(expect.any(Number));
     mocks.setDatabaseFailures(true, true);
     await expect(loadPreferences()).resolves.toEqual(expected);
+  });
+
+  it("does not trust an older unlocked SQLite row when the fallback cannot be read", async () => {
+    mocks.setPreferencesJson(JSON.stringify({ appLockEnabled: false }), 1);
+    await mocks.setItemAsync(
+      "t3code.preferences.fallback",
+      JSON.stringify({ payload: JSON.stringify({ appLockEnabled: true }), updatedAt: 2 }),
+    );
+    mocks.getItemAsync.mockRejectedValueOnce(new Error("secure storage unavailable"));
+    await expect(loadPreferences()).rejects.toMatchObject({ _tag: "MobilePreferencesLoadError" });
+    mocks.getItemAsync.mockRejectedValueOnce(new Error("secure storage unavailable"));
+    await expect(savePreferencesPatch({ baseFontSize: 19 })).rejects.toMatchObject({
+      _tag: "MobilePreferencesSaveError",
+    });
+    await expect(loadPreferences()).resolves.toEqual({ appLockEnabled: true });
+  });
+
+  it.each([null, "true", 1])("keeps malformed lock setting %j closed", async (appLockEnabled) => {
+    mocks.setPreferencesJson(JSON.stringify({ appLockEnabled }), 1);
+    await expect(loadPreferences()).rejects.toMatchObject({ _tag: "MobilePreferencesLoadError" });
+    await expect(savePreferencesPatch({ baseFontSize: 19 })).rejects.toMatchObject({
+      _tag: "MobilePreferencesSaveError",
+    });
   });
 
   it("discards malformed saved PR and issue views without discarding other preferences", async () => {
@@ -220,17 +249,26 @@ describe("mobile connection storage", () => {
   });
 
   it("ignores a stale fallback when its previous deletion failed", async () => {
-    mocks.setPreferencesJson(JSON.stringify({ baseFontSize: 21 }), 30);
+    const current = { baseFontSize: 21, appLockEnabled: true };
+    mocks.setPreferencesJson(JSON.stringify(current), 30);
     await mocks.setItemAsync(
       "t3code.preferences.fallback",
       JSON.stringify({
-        payload: JSON.stringify({ baseFontSize: 19 }),
+        payload: JSON.stringify({ baseFontSize: 19, appLockEnabled: false }),
         updatedAt: 20,
       }),
     );
 
-    await expect(loadPreferences()).resolves.toEqual({ baseFontSize: 21 });
-    expect(JSON.parse(mocks.getPreferencesJson() ?? "")).toEqual({ baseFontSize: 21 });
+    mocks.deleteItemAsync.mockRejectedValueOnce(new Error("secure storage unavailable"));
+    await expect(loadPreferences()).resolves.toEqual(current);
+    mocks.setDatabaseFailures(true, false);
+    await expect(loadPreferences()).rejects.toMatchObject({ _tag: "MobilePreferencesLoadError" });
+    await expect(savePreferencesPatch({ baseFontSize: 19 })).rejects.toMatchObject({
+      _tag: "MobilePreferencesSaveError",
+    });
+    mocks.setDatabaseFailures(false, false);
+    await expect(loadPreferences()).resolves.toEqual(current);
+    expect(JSON.parse(mocks.getPreferencesJson() ?? "")).toEqual(current);
     expect(mocks.getStoredValue("t3code.preferences.fallback")).toBeNull();
   });
 

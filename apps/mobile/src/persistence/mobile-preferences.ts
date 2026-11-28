@@ -593,17 +593,7 @@ const make = Effect.fn("MobilePreferencesStore.make")(function* () {
       );
     }
 
-    const fallbackResult = yield* Effect.result(secureStorage.getItem(PREFERENCES_FALLBACK_KEY));
-    let fallbackJson: string | null = null;
-    if (fallbackResult._tag === "Success") {
-      fallbackJson = fallbackResult.success;
-    } else if (Option.isNone(storedJson)) {
-      return yield* fallbackResult.failure;
-    } else {
-      yield* Effect.logWarning("Could not inspect the mobile preferences fallback.").pipe(
-        Effect.annotateLogs({ error: fallbackResult.failure }),
-      );
-    }
+    const fallbackJson = yield* secureStorage.getItem(PREFERENCES_FALLBACK_KEY);
 
     const fallback = parseFallback(fallbackJson);
     const storedPreferences = Option.isSome(storedJson)
@@ -661,7 +651,12 @@ const make = Effect.fn("MobilePreferencesStore.make")(function* () {
 
     return parsed === null
       ? { preferences: {}, unreadable }
-      : { preferences: sanitizePreferences(parsed), unreadable: false };
+      : {
+          preferences: sanitizePreferences(parsed),
+          unreadable:
+            (!databaseAvailable && parsed.appLockEnabled !== true) ||
+            (parsed.appLockEnabled !== undefined && typeof parsed.appLockEnabled !== "boolean"),
+        };
   });
 
   // Stored settings that exist but can't be read fail the load, so the app lock stays closed.
