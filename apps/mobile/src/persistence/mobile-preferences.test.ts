@@ -67,11 +67,24 @@ describe("MobilePreferencesStore", () => {
     }).pipe(Effect.provide(storeWith(null, { databaseFails: true }))),
   );
 
-  it.effect("a save replaces unreadable preferences", () =>
+  it.effect("a save cannot overwrite unreadable preferences and disable the lock", () =>
     Effect.gen(function* () {
       const store = yield* MobilePreferences.MobilePreferencesStore;
-      yield* store.savePatch({ appLockEnabled: true });
-      expect(yield* store.load).toEqual({ appLockEnabled: true });
+      const saved = yield* Effect.exit(store.savePatch({ themeMode: "dark" }));
+      expect(Exit.isFailure(saved)).toBe(true);
+      expect(Exit.isFailure(yield* Effect.exit(store.load))).toBe(true);
     }).pipe(Effect.provide(storeWith("{not json"))),
+  );
+
+  it.effect("keeps the lock and other readable preferences across unrelated saves", () =>
+    Effect.gen(function* () {
+      const store = yield* MobilePreferences.MobilePreferencesStore;
+      yield* store.savePatch({ themeMode: "dark" });
+      expect(yield* store.load).toEqual({
+        appLockEnabled: true,
+        baseFontSize: 18,
+        themeMode: "dark",
+      });
+    }).pipe(Effect.provide(storeWith(JSON.stringify({ appLockEnabled: true, baseFontSize: 18 })))),
   );
 });

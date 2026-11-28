@@ -665,7 +665,6 @@ const make = Effect.fn("MobilePreferencesStore.make")(function* () {
   });
 
   // Stored settings that exist but can't be read fail the load, so the app lock stays closed.
-  // Saves still start from defaults and overwrite them, which repairs the store.
   const load = lock
     .withPermits(1)(
       loadUnlocked.pipe(
@@ -688,7 +687,12 @@ const make = Effect.fn("MobilePreferencesStore.make")(function* () {
       lock
         .withPermits(1)(
           Effect.gen(function* () {
-            const { preferences: current } = yield* loadUnlocked;
+            const { preferences: current, unreadable } = yield* loadUnlocked;
+            if (unreadable) {
+              return yield* new MobilePreferencesSaveError({
+                cause: "Stored preferences are unreadable; refusing to overwrite them.",
+              });
+            }
             const patch = yield* Effect.try({
               try: () => transform(current),
               catch: (cause) => new MobilePreferencesSaveError({ cause }),

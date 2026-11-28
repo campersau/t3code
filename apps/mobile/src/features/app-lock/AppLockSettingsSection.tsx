@@ -39,7 +39,7 @@ export function AppLockSettingsSection() {
     const result = await authenticateAppLock(
       value ? gt("Turn on app lock") : gt("Turn off app lock"),
     );
-    if (result === "success" || (!value && result === "no-screen-lock")) {
+    if (result === "success") {
       void savePreferences({ appLockEnabled: value });
       return;
     }

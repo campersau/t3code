@@ -11,11 +11,13 @@ import { Fragment, useEffect, useEffectEvent } from "react";
 import * as Dialog from "../../components/ui/Dialog";
 import { m } from "../../i18n/messages";
 import { loadPreferences, updatePreferences } from "../../persistence/imperative";
+import { appAtomRegistry } from "../../state/atom-registry";
 import { authEnvironment } from "../../state/auth";
 import { useEnvironments } from "../../state/environments";
 import { useEnvironmentQuery } from "../../state/query";
 import { useEnvironmentsWithScope } from "../../state/session";
 import { useAtomCommand } from "../../state/use-atom-command";
+import { appLockBlockedAtom } from "../app-lock/appLockRuntime";
 import {
   type ConnectDeviceApprovalPrompt,
   connectDeviceApprovalPrompts,
@@ -181,7 +183,8 @@ const watchedEnvironments = new Set<EnvironmentId>();
 
 // One queue for every host: a second Android alert would replace an unanswered first one.
 const approvalPrompts = createApprovalPromptQueue<QueuedApprovalPrompt>((prompt, answer) => {
-  const respond = (action: () => Promise<ApprovalAnswer>, failure: string) => () =>
+  const respond = (action: () => Promise<ApprovalAnswer>, failure: string) => () => {
+    if (appAtomRegistry.get(appLockBlockedAtom)) return answer("later");
     void action().then((outcome) => {
       // A host that went away or lost access cannot be retried; let the next prompt show.
       if (outcome === "done" || !watchedEnvironments.has(prompt.environmentId)) {
@@ -205,6 +208,7 @@ const approvalPrompts = createApprovalPromptQueue<QueuedApprovalPrompt>((prompt,
         { onDismiss: () => answer("later") },
       );
     });
+  };
   Dialog.alert(
     prompt.title,
     prompt.message,

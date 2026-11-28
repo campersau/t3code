@@ -19798,7 +19798,7 @@ snapshots:
 
   expo-local-authentication@58.0.3(expo@58.0.26):
     dependencies:
-      expo: 58.0.26(f1276074af5eee14937223530600d31d)
+      expo: 58.0.26(f6f33b970de7d50f6fa7b2a740636fbe)
       invariant: 2.2.4
 
   expo-manifests@58.0.1(expo@58.0.26):

@@ -111,7 +111,7 @@ import { pruneNewTaskBranchCheckouts } from "./features/threads/NewTaskDraftRout
 import { installAppUpdateChecks } from "./features/updates/app-updates";
 import { perfProbe } from "./features/development/perf-probe-hooks";
 import { AppLockGate } from "./features/app-lock/AppLockGate";
-import { installAppLockRuntime } from "./features/app-lock/appLockRuntime";
+import { appLockBlockedAtom, installAppLockRuntime } from "./features/app-lock/appLockRuntime";
 
 import "../global.css";
 
@@ -292,6 +292,7 @@ export default function App() {
 function AppContent() {
   const { themeAppearance } = useAppearancePreferences();
   const navigationTheme = useMobileNavigationTheme();
+  const appLockBlocked = useAtomValue(appLockBlockedAtom);
 
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- matches the Android navigation bar to the app theme, as StatusBar does for the status bar
   useEffect(() => {
@@ -306,7 +307,7 @@ function AppContent() {
       <SplashScreenCoordinator />
       <QuickActionsLanguage />
       <SubscriptionUsageCoordinator />
-      <ConnectDeviceApprovalCoordinator />
+      {appLockBlocked ? null : <ConnectDeviceApprovalCoordinator />}
       <GestureHandlerRootView
         className="flex-1"
         onTouchStartCapture={perfProbe?.touchStart}
@@ -326,7 +327,7 @@ function AppContent() {
                   theme={navigationTheme}
                   onStateChange={handleNavigationStateChange}
                 />
-                <Dialog.Host />
+                {appLockBlocked ? null : <Dialog.Host />}
                 <ThreadArrangementHost />
                 <ProjectChipIconRasterizer />
               </NativeLayoutMetricsProvider>

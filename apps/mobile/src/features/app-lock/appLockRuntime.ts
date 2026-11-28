@@ -29,6 +29,11 @@ export const appLockSessionAtom = Atom.make<AppLockSession>({
   prompting: false,
 }).pipe(Atom.keepAlive, Atom.withLabel("mobile:app-lock:session"));
 
+export const appLockBlockedAtom = Atom.make((get) => {
+  const session = get(appLockSessionAtom);
+  return get(appLockEnabledAtom) && (!session.unlocked || !session.active);
+}).pipe(Atom.keepAlive, Atom.withLabel("mobile:app-lock:blocked"));
+
 function updateSession(patch: Partial<AppLockSession>): void {
   appAtomRegistry.set(appLockSessionAtom, { ...appAtomRegistry.get(appLockSessionAtom), ...patch });
 }
