@@ -141,15 +141,26 @@ describe("mobile connection storage", () => {
     await expect(loadPreferences()).resolves.toEqual({ baseFontSize: 17 });
   });
 
-  it("falls back to secure storage when SQLite cannot save preferences", async () => {
+  it("preserves the lock when SQLite fails to read or save preferences", async () => {
+    mocks.setPreferencesJson(JSON.stringify({ appLockEnabled: true }), 1);
     mocks.setDatabaseFailures(true, true);
-    await expect(savePreferencesPatch({ baseFontSize: 19 })).resolves.toEqual({ baseFontSize: 19 });
+    await expect(savePreferencesPatch({ baseFontSize: 19 })).rejects.toMatchObject({
+      _tag: "MobilePreferencesSaveError",
+    });
+    expect(JSON.parse(mocks.getPreferencesJson() ?? "")).toEqual({ appLockEnabled: true });
+    expect(mocks.getStoredValue("t3code.preferences.fallback")).toBeNull();
+
+    mocks.setDatabaseFailures(false, true);
+    const expected = { appLockEnabled: true, baseFontSize: 19 };
+    await expect(savePreferencesPatch({ baseFontSize: 19 })).resolves.toEqual(expected);
     const fallback = JSON.parse(mocks.getStoredValue("t3code.preferences.fallback") ?? "") as {
       readonly payload: string;
       readonly updatedAt: number;
     };
-    expect(JSON.parse(fallback.payload)).toEqual({ baseFontSize: 19 });
+    expect(JSON.parse(fallback.payload)).toEqual(expected);
     expect(fallback.updatedAt).toEqual(expect.any(Number));
+    mocks.setDatabaseFailures(true, true);
+    await expect(loadPreferences()).resolves.toEqual(expected);
   });
 
   it("discards malformed saved PR and issue views without discarding other preferences", async () => {
