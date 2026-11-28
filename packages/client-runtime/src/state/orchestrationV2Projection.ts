@@ -266,11 +266,15 @@ function upsertVisibleTurnItem(
 // items never received stay absent.
 function restoreQueuedUserItems(
   projection: OrchestrationV2ThreadProjection,
-  runId: OrchestrationV2Run["id"],
+  runId?: OrchestrationV2Run["id"],
 ): OrchestrationV2ThreadProjection["visibleTurnItems"] {
   let visibleTurnItems = projection.visibleTurnItems;
   for (const item of projection.turnItems) {
-    if (item.runId !== runId || item.type !== "user_message" || item.inputIntent !== "queued_turn")
+    if (
+      (runId !== undefined && item.runId !== runId) ||
+      item.type !== "user_message" ||
+      item.inputIntent !== "queued_turn"
+    )
       continue;
     if (!shouldShowLocalTurnItem(projection, item)) continue;
     visibleTurnItems = upsertVisibleTurnItem(
@@ -281,6 +285,20 @@ function restoreQueuedUserItems(
     );
   }
   return visibleTurnItems;
+}
+
+// Older caches can retain delivered queued input hidden by the former visibility rule.
+// Request cards retained outside the window must not be pulled into the timeline.
+export function restoreCachedProjectionVisibility(
+  projection: OrchestrationV2ThreadProjection,
+): OrchestrationV2ThreadProjection {
+  const visibleTurnItems = restoreQueuedUserItems({
+    ...projection,
+    visibleTurnItems: activeVisibleTurnItems(projection),
+  });
+  return visibleTurnItems === projection.visibleTurnItems
+    ? projection
+    : { ...projection, visibleTurnItems };
 }
 
 export function applyOrchestrationV2ProjectionEvent(
@@ -296,7 +314,7 @@ export function applyOrchestrationV2ProjectionEvent(
   switch (event.type) {
     case "thread.pull-request-link-updated":
       return {
-        ...base,
+        ...projection,
         thread: applyThreadPullRequestLinkUpdate(projection.thread, event.payload),
       };
     case "thread.created":
@@ -311,16 +329,18 @@ export function applyOrchestrationV2ProjectionEvent(
     case "thread.pinned":
     case "thread.unpinned":
     case "thread.pin-reordered":
-    case "thread.active-reordered":
     case "thread.metadata-updated":
-    case "thread.pull-request-synced":
-    case "thread.issue-synced":
     case "thread.runtime-mode-updated":
     case "thread.interaction-mode-updated":
     case "thread.model-selection-updated":
     case "thread.provider-switched":
     case "thread.guest-share-updated":
       return { ...base, thread: event.payload };
+    // Reordering and PR refreshes keep the orchestrator's activity time, as the server does.
+    case "thread.active-reordered":
+    case "thread.pull-request-synced":
+    case "thread.issue-synced":
+      return { ...base, thread: event.payload, updatedAt: event.payload.updatedAt };
     // Visited tracking and tags are not activity: skip the updatedAt bump.
     case "thread.visited":
     case "thread.tags-updated":

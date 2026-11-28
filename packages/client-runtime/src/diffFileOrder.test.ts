@@ -50,6 +50,21 @@ describe("orderDiffFilesForReview", () => {
     ]);
   });
 
+  it.each([
+    "bun.lock",
+    "deno.lock",
+    "npm-shrinkwrap.json",
+    "poetry.lock",
+    "Pipfile.lock",
+    "flake.lock",
+  ])("places the %s lockfile after source like other lockfiles", (lockfile) => {
+    expect(order([file(lockfile), file("package.json"), file("src/index.ts")])).toEqual([
+      "package.json",
+      "src/index.ts",
+      lockfile,
+    ]);
+  });
+
   it("keeps both entries of a path that changed type, such as a file replaced by a symlink", () => {
     const deleted = { ...file("AGENTS.md"), additionLines: [], deletionLines: ["# Agents"] };
     const added = file("AGENTS.md", ["CLAUDE.md"]);
@@ -80,12 +95,24 @@ describe("orderDiffFilesForReview", () => {
     expect(
       order([file("src/ui/a.ts", ['import { b } from "../lib/b";']), file("src/lib/b.ts")]),
     ).toEqual(["src/lib/b.ts", "src/ui/a.ts"]);
+    expect(order([file("a.ts", ['import { z } from "../z";']), file("z.ts")])).toEqual([
+      "a.ts",
+      "z.ts",
+    ]);
   });
 
   it("resolves a directory specifier to that directory's index file", () => {
     expect(
       order([file("src/a.ts", ['import { b } from "./lib";']), file("src/lib/index.ts")]),
     ).toEqual(["src/lib/index.ts", "src/a.ts"]);
+    expect(order([file("a/app.ts", ['import { x } from "..";']), file("index.ts")])).toEqual([
+      "index.ts",
+      "a/app.ts",
+    ]);
+    expect(order([file("app.ts", ['import { x } from ".";']), file("index.ts")])).toEqual([
+      "index.ts",
+      "app.ts",
+    ]);
   });
 
   it("resolves .mts and .cts modules from NodeNext and extensionless specifiers", () => {
@@ -103,6 +130,17 @@ describe("orderDiffFilesForReview", () => {
     expect(order([file("src/a.ts", ['import { b } from "~/lib/b";']), file("lib/b.ts")])).toEqual([
       "lib/b.ts",
       "src/a.ts",
+    ]);
+  });
+
+  it("does not fall back to the basename for a relative specifier outside the diff", () => {
+    expect(order([file("src/a.ts", ['import "./z";']), file("zzz/z.ts")])).toEqual([
+      "src/a.ts",
+      "zzz/z.ts",
+    ]);
+    expect(order([file("src/sub/a.ts", ['import "../z";']), file("zzz/z.ts")])).toEqual([
+      "src/sub/a.ts",
+      "zzz/z.ts",
     ]);
   });
 
@@ -133,6 +171,11 @@ describe("orderDiffFilesForReview", () => {
     expect(order([file("src/a.ts", ['import { b } from "./b.js";']), file("src/b.ts")])).toEqual([
       "src/b.ts",
       "src/a.ts",
+    ]);
+    expect(order([file("a.js", ['import "./z.mjs";']), file("z.mjs"), file("z.js")])).toEqual([
+      "z.js",
+      "z.mjs",
+      "a.js",
     ]);
   });
 
@@ -238,6 +281,38 @@ describe("orderDiffFilesForReview", () => {
       "dist/a.js",
       "pnpm-lock.yaml",
     ]);
+  });
+
+  it("orders tests by the source beside them when another folder has the same name", () => {
+    expect(
+      order([
+        file("pkg-a/src/index.ts"),
+        file("pkg-a/src/utils.ts"),
+        file("pkg-b/src/index.ts", ['import { u } from "./utils";']),
+        file("pkg-b/src/utils.ts"),
+        file("pkg-b/src/index.test.ts"),
+        file("pkg-b/src/utils.test.ts"),
+      ]),
+    ).toEqual([
+      "pkg-a/src/index.ts",
+      "pkg-a/src/utils.ts",
+      "pkg-b/src/utils.ts",
+      "pkg-b/src/index.ts",
+      "pkg-b/src/utils.test.ts",
+      "pkg-b/src/index.test.ts",
+    ]);
+  });
+
+  it("prefers the source beside a dotted test over a longer same-named one elsewhere", () => {
+    expect(
+      order([
+        file("y/a.logic.ts"),
+        file("z/a.ts", ['import { b } from "./b";']),
+        file("z/b.ts"),
+        file("z/a.logic.test.ts"),
+        file("z/b.test.ts"),
+      ]),
+    ).toEqual(["y/a.logic.ts", "z/b.ts", "z/a.ts", "z/b.test.ts", "z/a.logic.test.ts"]);
   });
 
   it("puts a test with no source in the diff after the ones that have theirs", () => {

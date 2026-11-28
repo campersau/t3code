@@ -2,10 +2,13 @@ import { describe, expect, it } from "vite-plus/test";
 
 import { ThreadId, TurnItemId, type OrchestrationV2TurnItem } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import { compactT3McpToolOutput } from "@t3tools/shared/toolOutput";
 
 import {
   resolveViewedImageAsset,
   resolveWorkEntryToolPresentation,
+  summarizeToolGroup,
+  toolGroupSummaryKind,
   toolItemForDisplay,
   type WorkLogPresentationEntry,
   workEntryIndicatesToolFailure,
@@ -160,6 +163,28 @@ describe("resolveWorkEntryToolPresentation", () => {
     ).toEqual({ displayName: "Taking a snapshot of the preview page", icon: "browser" });
   });
 
+  it("names the reported outcome when it contradicts the row's verb", () => {
+    const row = (tool: string, output: unknown) =>
+      resolveWorkEntryToolPresentation({
+        label: `T3-code.${tool}`,
+        toolLifecycleStatus: "completed",
+        toolData: { output: compactT3McpToolOutput(`t3-code.${tool}`, output) },
+      })?.displayName;
+    expect(row("pull_request_create", { number: 470, created: false })).toBe(
+      "Found 1 open pull request",
+    );
+    expect(row("pull_request_create", { number: 470, created: true })).toBe(
+      "Opened a pull request",
+    );
+    expect(row("ci_rerun", { number: 883, checks: [] })).toBe("Found no failed checks to re-run");
+    expect(row("ci_rerun", { number: 883, checks: [{ name: "ci", rerun: true }] })).toBe(
+      "Re-ran CI",
+    );
+    expect(row("pull_request_merge", { number: 1, state: "open" })).toBe(
+      "Queued 1 pull request to merge",
+    );
+  });
+
   it("uses the summary's state only when the provider omitted a lifecycle status", () => {
     const entry = { label: "T3-code.preview_click" };
     expect(resolveWorkEntryToolPresentation(entry, "inProgress")?.displayName).toBe(
@@ -290,5 +315,76 @@ describe("workEntriesViewedImages", () => {
         read("again", "/repo/a.png", "completed"),
       ]),
     ).toEqual(["/repo/a.png", "/repo/b.png"]);
+  });
+});
+
+describe("summarizeToolGroup read counts", () => {
+  const read = (id: string, filePath: string, offset?: number): WorkLogPresentationEntry => ({
+    id,
+    createdAt: "2026-11-27T00:00:00.000Z",
+    label: "Read",
+    tone: "tool",
+    itemType: "dynamic_tool",
+    toolTitle: "Read",
+    toolLifecycleStatus: "completed",
+    structuredPayload: {
+      id: TurnItemId.make(id),
+      threadId: ThreadId.make("thread"),
+      runId: null,
+      nodeId: null,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: 0,
+      status: "completed",
+      title: null,
+      startedAt: null,
+      completedAt: null,
+      updatedAt: DateTime.makeUnsafe("2026-11-27T00:00:00.000Z"),
+      type: "dynamic_tool",
+      toolName: "Read",
+      input: offset === undefined ? { file_path: filePath } : { file_path: filePath, offset },
+    },
+  });
+
+  it("counts a file read in several chunks once, as edits do", () => {
+    expect(
+      summarizeToolGroup([
+        read("a1", "/repo/src/a.ts"),
+        read("a2", "/repo/src/a.ts", 200),
+        read("b", "/repo/src/b.ts"),
+      ]).summary,
+    ).toBe("Read 2 files");
+  });
+});
+
+describe("summarizeToolGroup approvals", () => {
+  const command: WorkLogPresentationEntry = {
+    id: "command",
+    createdAt: "2026-11-27T00:00:00.000Z",
+    label: "pwd",
+    tone: "tool",
+    itemType: "command_execution",
+    command: "pwd",
+    toolLifecycleStatus: "completed",
+  };
+  const approval: WorkLogPresentationEntry = {
+    id: "approval",
+    createdAt: "2026-11-27T00:00:00.000Z",
+    label: "Approval requested",
+    tone: "tool",
+    itemType: "approval_request",
+    requestKind: "command",
+    toolLifecycleStatus: "completed",
+  };
+
+  it("does not count the approval for a step as a tool of its own", () => {
+    expect(summarizeToolGroup([command, approval]).summary).toBe("Ran 1 command");
+    expect(toolGroupSummaryKind([command, approval])).toBe("command");
+  });
+
+  it("still summarizes a group that only holds an approval", () => {
+    expect(summarizeToolGroup([approval]).summary).toBe("Used 1 tool");
   });
 });

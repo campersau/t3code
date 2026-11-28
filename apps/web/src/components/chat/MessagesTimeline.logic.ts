@@ -105,7 +105,8 @@ function workEntryIsActiveTurnActivity(entry: WorkLogEntry): boolean {
   );
 }
 
-function singleToolCallLabel(entry: WorkLogEntry, resolve: MessageResolver): string {
+// Undefined leaves the label to the row, which knows the workspace root to shorten paths with.
+function singleToolCallLabel(entry: WorkLogEntry, resolve: MessageResolver): string | undefined {
   if (entry.itemType === "reasoning") {
     return entry.detail?.trim().replace(/\s+/g, " ") || resolve(msg("Thought"));
   }
@@ -118,7 +119,7 @@ function singleToolCallLabel(entry: WorkLogEntry, resolve: MessageResolver): str
       : null;
   if (title) return title;
   if (entry.itemType === "web_search") return entry.toolTitle ?? resolve(msg("Web search"));
-  return workEntryDisplayLabel(entry, undefined, resolve);
+  return undefined;
 }
 
 function workEntryToolDataRecord(entry: WorkLogEntry): Record<string, unknown> | undefined {
@@ -381,6 +382,27 @@ export function resolveTimelineMinimapTopPercent(index: number, itemCount: numbe
     return 0;
   }
   return (Math.max(0, Math.min(index, itemCount - 1)) / (itemCount - 1)) * 100;
+}
+
+// Strips are 2px tall; centers 4px apart or closer merge into one bar once layout
+// rounds their positions.
+const TIMELINE_MINIMAP_MIN_MARK_SPACING = 5;
+
+/** Strips that fit the measured rail; past that, neighbouring items share one. */
+export function resolveTimelineMinimapMarkCount(itemCount: number, railHeight: number): number {
+  if (railHeight <= 0) return itemCount;
+  const capacity = Math.floor(railHeight / TIMELINE_MINIMAP_MIN_MARK_SPACING) + 1;
+  return Math.min(itemCount, Math.max(2, capacity));
+}
+
+/** The strip nearest the item's own position on the rail. */
+export function resolveTimelineMinimapMarkIndex(
+  itemIndex: number,
+  itemCount: number,
+  markCount: number,
+): number {
+  if (markCount >= itemCount) return itemIndex;
+  return Math.round((itemIndex / (itemCount - 1)) * (markCount - 1));
 }
 
 export function resolveTimelineMinimapIndexFromPointer(input: {
@@ -2133,16 +2155,17 @@ export function deriveMessagesTimelineRows(
           workLogEntryIsToolLike(visibleGroupedEntries[0]!)
         ) {
           const singleEntry = visibleGroupedEntries[0]!;
+          const displayLabel =
+            toolGroupAction(singleEntry) === "edit"
+              ? summarizeToolGroup(visibleGroupedEntries, resolve).summary
+              : singleToolCallLabel(singleEntry, resolve);
           nextRows.push({
             kind: "work",
             id: timelineEntry.id,
             createdAt: timelineEntry.createdAt,
             groupedEntries: visibleGroupedEntries,
             isExpandedToolGroup: false,
-            displayLabel:
-              toolGroupAction(singleEntry) === "edit"
-                ? summarizeToolGroup(visibleGroupedEntries, resolve).summary
-                : singleToolCallLabel(singleEntry, resolve),
+            ...(displayLabel === undefined ? {} : { displayLabel }),
           });
         } else {
           const groupId = workGroupId(timelineEntry.id);
@@ -2767,7 +2790,7 @@ export function computeStableMessagesTimelineRows(
 }
 
 function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean {
-  if (a.kind !== b.kind || a.id !== b.id) return false;
+  if (a.kind !== b.kind || a.id !== b.id || a.continuesWorkLog !== b.continuesWorkLog) return false;
 
   switch (a.kind) {
     case "working":
@@ -2783,8 +2806,10 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
         a.label === bt.label
       );
     }
-    case "worktree-setup":
-      return a.snapshot === (b as typeof a).snapshot;
+    case "worktree-setup": {
+      const bw = b as typeof a;
+      return a.snapshot === bw.snapshot && a.embedded === bw.embedded;
+    }
 
     case "assistant-meta": {
       const bm = b as typeof a;

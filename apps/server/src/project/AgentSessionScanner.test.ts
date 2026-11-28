@@ -37,6 +37,21 @@ import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.t
 import * as ServerSettings from "../serverSettings.ts";
 import * as AgentSessionScanner from "./AgentSessionScanner.ts";
 
+// Reftable needs Git 2.45+; older Git (Ubuntu 24.04 ships 2.43) rejects --ref-format.
+const reftableSupported = (() => {
+  const probe = NodeFS.mkdtempSync(NodeOS.tmpdir() + "/t3code-reftable-probe-");
+  try {
+    NodeChildProcess.execFileSync("git", ["init", "--ref-format=reftable", probe], {
+      stdio: "ignore",
+    });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    NodeFS.rmSync(probe, { recursive: true, force: true });
+  }
+})();
+
 const makeProjectShell = (workspaceRoot: string): OrchestrationProjectShell => ({
   id: ProjectId.make("project-1"),
   title: "Imported",
@@ -1237,27 +1252,31 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
     it.effect("imports a checkout's sessions from the linked worktrees the scan counts", () =>
       Effect.gen(function* () {
         const path = yield* Path.Path;
-        const fileSystem = yield* FileSystem.FileSystem;
         const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
         yield* TestClock.setTime(nowMs);
         const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
         const codexHomePath = yield* makeTempDir("t3code-codex-home-");
         const repo = yield* makeTempDir("t3code-workspace-repo-");
-        yield* fileSystem.makeDirectory(path.join(repo, ".git"));
-        yield* fileSystem.writeFileString(path.join(repo, ".git", "config"), "[core]\n");
-        const worktreeGitDir = path.join(repo, ".git", "worktrees", "feature");
-        yield* fileSystem.makeDirectory(worktreeGitDir, { recursive: true });
-        yield* fileSystem.writeFileString(path.join(worktreeGitDir, "commondir"), "../..\n");
-        yield* fileSystem.writeFileString(
-          path.join(worktreeGitDir, "HEAD"),
-          "ref: refs/heads/feature\n",
-        );
-        const worktree = path.join(repo, ".claude", "worktrees", "feature");
-        yield* fileSystem.makeDirectory(worktree, { recursive: true });
-        yield* fileSystem.writeFileString(
-          path.join(worktree, ".git"),
-          `gitdir: ${worktreeGitDir}\n`,
-        );
+        const branch = "feat\u00a0";
+        const worktree = path.join(repo, ".claude", "worktrees", "feature\u2028tools");
+        yield* Effect.sync(() => {
+          const git = (...args: string[]) =>
+            NodeChildProcess.execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+          git("init");
+          git(
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "Initial commit",
+          );
+          git("worktree", "add", "-b", branch, worktree);
+        });
 
         for (const [index, [cwd, sessionId]] of [
           [repo, "at-root"],
@@ -1293,9 +1312,66 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
           ),
         ).toEqual([
           { sessionId: "at-root", worktree: null },
-          { sessionId: "in-worktree", worktree: { path: worktree, branch: "feature" } },
+          { sessionId: "in-worktree", worktree: { path: worktree, branch } },
         ]);
       }),
+    );
+
+    it.effect.skipIf(!reftableSupported)(
+      "imports a reftable worktree's sessions on its checked-out branch",
+      () =>
+        Effect.gen(function* () {
+          const path = yield* Path.Path;
+          const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+          yield* TestClock.setTime(nowMs);
+          const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+          const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+          const repo = yield* makeTempDir("t3code-workspace-repo-");
+          const worktree = path.join(repo, ".claude", "worktrees", "feature");
+          yield* Effect.sync(() => {
+            const git = (...args: string[]) =>
+              NodeChildProcess.execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+            git("init", "--ref-format=reftable");
+            git(
+              "-c",
+              "user.name=Test",
+              "-c",
+              "user.email=test@example.com",
+              "-c",
+              "commit.gpgsign=false",
+              "commit",
+              "--allow-empty",
+              "-m",
+              "Initial commit",
+            );
+            git("worktree", "add", "-b", "feature", worktree);
+          });
+          yield* writeTranscript({
+            filePath: path.join(claudeHomePath, "projects", "-slug", "in-worktree.jsonl"),
+            contents: `${JSON.stringify({
+              type: "user",
+              cwd: worktree,
+              sessionId: "in-worktree",
+              message: { role: "user", content: "Fix the project" },
+            })}\n${JSON.stringify({
+              type: "assistant",
+              sessionId: "in-worktree",
+              message: { role: "assistant", content: [{ type: "text", text: "Done" }] },
+            })}\n`,
+            mtimeMs: nowMs - 60 * 60 * 1000,
+          });
+
+          const outcomes = yield* runRecentThreadOutcomes({
+            claudeHomePath,
+            codexHomePath,
+            workspaceRoot: repo,
+          });
+          expect(
+            outcomes.flatMap((outcome) =>
+              outcome._tag === "Importable" ? [outcome.worktree] : [],
+            ),
+          ).toEqual([{ path: worktree, branch: "feature" }]);
+        }),
     );
 
     it.effect("excludes sandboxes under the configured worktrees dir without .t3 in the path", () =>
@@ -1960,6 +2036,29 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
         });
 
         expect(threads.map((thread) => thread.title)).toEqual(["Renamed chat"]);
+
+        const tailRename = `${encodeTranscriptRecord({
+          id: "named-session",
+          thread_name: "Tail rename",
+          updated_at: "unknown",
+        })}\n`;
+        const tailPadding = `${"x".repeat(1024 * 1024 - Buffer.byteLength(tailRename) - 1)}\n`;
+        yield* fileSystem.writeFileString(
+          path.join(codexHomePath, "session_index.jsonl"),
+          `${encodeTranscriptRecord({
+            id: "named-session",
+            thread_name: "Older name",
+            updated_at: "unknown",
+          })}\n${tailRename}${tailPadding}`,
+        );
+
+        const tailBoundaryThreads = yield* runRecentThreads({
+          claudeHomePath,
+          codexHomePath,
+          workspaceRoot: workspace,
+        });
+
+        expect(tailBoundaryThreads.map((thread) => thread.title)).toEqual(["Tail rename"]);
       }),
     );
 
@@ -4329,5 +4428,157 @@ describe("parseAgentSessionTranscript", () => {
         ? null
         : { title: thread.title, texts: thread.messages.map((message) => message.text) },
     ).toEqual(expected);
+  });
+
+  it.each([
+    {
+      source: "claudeAgent" as const,
+      records: (first: string, blank: string, code: string) => [
+        { type: "user", sessionId: "claude-session", message: { role: "user", content: first } },
+        { type: "user", sessionId: "claude-session", message: { role: "user", content: blank } },
+        {
+          type: "user",
+          sessionId: "claude-session",
+          message: {
+            role: "user",
+            content: [
+              { type: "text", text: blank },
+              { type: "text", text: code },
+            ],
+          },
+        },
+        {
+          type: "assistant",
+          sessionId: "claude-session",
+          message: { role: "assistant", content: [{ type: "text", text: code }] },
+        },
+      ],
+    },
+    {
+      source: "codex" as const,
+      records: (first: string, blank: string, code: string) => [
+        { type: "session_meta", payload: { id: "codex-session" } },
+        {
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: first }],
+          },
+        },
+        {
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: blank }],
+          },
+        },
+        {
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "user",
+            content: [
+              { type: "input_text", text: blank },
+              { type: "input_text", text: code },
+            ],
+          },
+        },
+        {
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: code }],
+          },
+        },
+      ],
+    },
+    {
+      source: "pi" as const,
+      records: (first: string, blank: string, code: string) => [
+        { type: "session", id: "pi-session" },
+        { type: "message", message: { role: "user", content: first } },
+        { type: "message", message: { role: "user", content: blank } },
+        {
+          type: "message",
+          message: {
+            role: "user",
+            content: [
+              { type: "text", text: blank },
+              { type: "text", text: code },
+            ],
+          },
+        },
+        {
+          type: "message",
+          message: { role: "assistant", content: [{ type: "text", text: code }] },
+        },
+      ],
+    },
+  ])(
+    "preserves leading indentation while dropping blank lines and empty blocks for $source",
+    ({ source, records }) => {
+      const first = "\n  - fix the importer\n    - nested\n";
+      const code = "\n    const x = 1;\n    return x;\n";
+      const thread = AgentSessionScanner.parseAgentSessionTranscript({
+        contents: records(first, "  \n\t ", code)
+          .map((record) => encodeTranscriptRecord(record))
+          .join("\n"),
+        source,
+        providerInstanceId: ProviderInstanceId.make(source),
+        fallbackSessionId: `${source}-session`,
+        lastActiveAtMs: Date.parse("2026-08-24T12:00:00.000Z"),
+      });
+
+      expect(thread?.title).toBe("- fix the importer");
+      expect(thread?.messages.map(({ role, text }) => ({ role, text }))).toEqual([
+        { role: "user", text: "  - fix the importer\n    - nested" },
+        { role: "user", text: "    const x = 1;\n    return x;" },
+        { role: "assistant", text: "    const x = 1;\n    return x;" },
+      ]);
+    },
+  );
+
+  it("hides generated response context in a turn whose Codex prompt is indented", () => {
+    const prompt = "    indented prompt";
+    const thread = AgentSessionScanner.parseAgentSessionTranscript({
+      contents: [
+        encodeTranscriptRecord({ type: "session_meta", payload: { id: "codex-session" } }),
+        encodeTranscriptRecord({
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "user",
+            internal_chat_message_metadata_passthrough: { turn_id: "turn-1" },
+            content: [
+              { type: "input_text", text: "<environment_context>\n</environment_context>" },
+            ],
+          },
+        }),
+        encodeTranscriptRecord({
+          type: "event_msg",
+          payload: { type: "user_message", message: prompt },
+        }),
+        encodeTranscriptRecord({
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "user",
+            internal_chat_message_metadata_passthrough: { turn_id: "turn-1" },
+            content: [{ type: "input_text", text: prompt }],
+          },
+        }),
+      ].join("\n"),
+      source: "codex",
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      fallbackSessionId: "fallback",
+      lastActiveAtMs: Date.parse("2026-08-24T12:00:00.000Z"),
+    });
+
+    expect(thread?.messages.map(({ role, text }) => ({ role, text }))).toEqual([
+      { role: "user", text: prompt },
+    ]);
   });
 });

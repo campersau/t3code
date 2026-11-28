@@ -5,10 +5,13 @@ import {
   MessageId,
   NodeId,
   ORCHESTRATION_V2_WS_METHODS,
+  ProviderDriverKind,
+  ProviderInstanceId,
   RuntimeRequestId,
   RunId,
   ThreadId,
   TurnItemId,
+  type OrchestrationV2Subagent,
   type OrchestrationV2ThreadDetailSnapshot,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadStreamItem,
@@ -49,7 +52,7 @@ import {
   decodeOrDiscardOrchestrationCache,
 } from "../platform/orchestrationCache.ts";
 import * as RpcSession from "../rpc/session.ts";
-import { v2Now, v2Projection, v2ThreadId } from "./orchestrationV2TestFixtures.ts";
+import { v2MessageRow, v2Now, v2Projection, v2ThreadId } from "./orchestrationV2TestFixtures.ts";
 import { onThreadRequestsResolved, type ThreadRequestsResolved } from "./threadRequests.ts";
 import { EMPTY_THREAD_HISTORY_META } from "./threadHistoryMerge.ts";
 import * as ThreadHistoryController from "./threadHistoryController.ts";
@@ -97,6 +100,7 @@ function testSession(
     ready: Effect.void,
     probe: Effect.void,
     inboundFrames: Effect.succeed(0),
+    awaitingReply: Effect.succeed(false),
     closed: Effect.never,
   };
 }
@@ -423,6 +427,74 @@ const deleted = (sequence = 3): OrchestrationV2ThreadStreamItem => {
 };
 
 describe("EnvironmentThreads", () => {
+  it.effect.each(["disk", "retained"] as const)(
+    "shows a delivered queued message that an older %s cache hid",
+    (cacheKind) =>
+      Effect.gen(function* () {
+        // The former rule hid the queued message of a started run that a restart cancelled.
+        const runId = RunId.make("run-cancelled-after-start");
+        const later = v2MessageRow("Later input", 2);
+        const delivered = {
+          ...v2MessageRow("Delivered before restart", 1).item,
+          runId,
+          inputIntent: "queued_turn",
+        } as OrchestrationV2TurnItem;
+        const projection: OrchestrationV2ThreadProjection = {
+          ...BASE_PROJECTION,
+          runs: [
+            {
+              id: runId,
+              threadId: THREAD_ID,
+              ordinal: 1,
+              providerInstanceId: BASE_PROJECTION.thread.providerInstanceId,
+              modelSelection: BASE_PROJECTION.thread.modelSelection,
+              providerThreadId: null,
+              userMessageId: MessageId.make("Delivered before restart"),
+              rootNodeId: null,
+              activeAttemptId: null,
+              status: "cancelled",
+              requestedAt: v2Now,
+              startedAt: v2Now,
+              completedAt: v2Now,
+              checkpointId: null,
+              contextHandoffId: null,
+            },
+          ],
+          turnItems: [delivered, later.item],
+          visibleTurnItems: [later],
+        };
+        const h = yield* makeHarness({
+          loadCached: Effect.succeedSome({
+            snapshotSequence: CACHED_SNAPSHOT_SEQUENCE,
+            projection,
+          }),
+          ...(cacheKind === "retained"
+            ? {
+                resumeCache: {
+                  owner: undefined,
+                  snapshot: {
+                    state: {
+                      ...EMPTY_ENVIRONMENT_THREAD_STATE,
+                      data: Option.some(projection),
+                      status: "live",
+                    },
+                    sequence: CACHED_SNAPSHOT_SEQUENCE,
+                    persisted: true,
+                  },
+                },
+              }
+            : {}),
+          completionMarker: true,
+        });
+        yield* Queue.offer(h.inputs, synchronized());
+        const state = yield* awaitThreadState(h.observed, (value) => value.status === "live");
+        expect(
+          Option.getOrThrow(state.data).visibleTurnItems.map((row) => row.sourceItemId),
+        ).toEqual([delivered.id, later.sourceItemId]);
+        expect(yield* Ref.get(h.loaderCalls)).toBe(0);
+      }),
+  );
+
   it.effect.each([
     ["disk", false],
     ["retained", false],
@@ -788,7 +860,39 @@ describe("EnvironmentThreads", () => {
         (value) => value.status === "deleted",
       );
       expect(Option.isNone(state.data)).toBe(true);
-      expect(yield* Ref.get(resumed.loaderCalls)).toBe(0);
+      // One HTTP check, then it parks: the old snapshot stays out and no socket opens.
+      yield* TestClock.adjust("1 minute");
+      expect(yield* Ref.get(resumed.loaderCalls)).toBe(1);
+      expect(yield* SubscriptionRef.get(resumed.subscriptionCount)).toBe(0);
+    }),
+  );
+
+  it.effect("opens a deleted thread again once the server has it back", () =>
+    Effect.gen(function* () {
+      const resumeCache: NonNullable<Parameters<typeof makeEnvironmentThreadState>[1]> = {
+        snapshot: undefined,
+        owner: undefined,
+      };
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const first = yield* makeHarness({ cached: BASE_PROJECTION, resumeCache });
+          const update = deleted();
+          if (update.kind !== "event") return yield* Effect.die("Expected an event");
+          yield* Queue.offer(first.inputs, { ...update, sequence: 8 });
+          yield* awaitThreadState(first.observed, (value) => value.status === "deleted");
+        }),
+      );
+      const resumed = yield* makeHarness({
+        resumeCache,
+        httpSnapshot: {
+          _tag: "present",
+          snapshot: { snapshotSequence: 12, projection: BASE_PROJECTION },
+        },
+      });
+      yield* Queue.offer(resumed.inputs, synchronized());
+      const state = yield* awaitThreadState(resumed.observed, (value) => value.status === "live");
+      expect(Option.getOrThrow(state.data)).toEqual(BASE_PROJECTION);
+      expect(yield* Ref.get(resumed.loaderCalls)).toBe(1);
     }),
   );
 
@@ -970,6 +1074,53 @@ describe("EnvironmentThreads", () => {
       expect(live.sequence).toBe(CACHED_SNAPSHOT_SEQUENCE + 1);
       expect(yield* Ref.get(harness.lastSubscribeAfterSequence)).toBe(CACHED_SNAPSHOT_SEQUENCE);
       expect(yield* Ref.get(harness.loaderCalls)).toBe(0);
+    }),
+  );
+
+  it.effect("opens a cached live subagent with a snapshot instead of resuming (#44183)", () =>
+    Effect.gen(function* () {
+      const at = DateTime.makeUnsafe("2026-06-20T00:00:00.000Z");
+      const waiting: OrchestrationV2Subagent = {
+        id: NodeId.make("subagent"),
+        threadId: THREAD_ID,
+        runId: null,
+        parentNodeId: NodeId.make("parent-node"),
+        origin: "app_owned",
+        createdBy: "agent",
+        driver: ProviderDriverKind.make("opencode"),
+        providerInstanceId: ProviderInstanceId.make("opencode"),
+        providerThreadId: null,
+        childThreadId: ThreadId.make("thread:child"),
+        nativeTaskRef: null,
+        prompt: "Reply pong",
+        title: "Pong response",
+        model: null,
+        status: "waiting",
+        result: null,
+        startedAt: at,
+        completedAt: null,
+        updatedAt: at,
+      };
+      const completed = { ...waiting, status: "completed" as const, completedAt: at };
+      const harness = yield* makeHarness({
+        cached: { ...BASE_PROJECTION, subagents: [waiting] },
+        completionMarker: true,
+      });
+
+      yield* Queue.offer(
+        harness.inputs,
+        snapshot({ ...BASE_PROJECTION, subagents: [completed] }, CACHED_SNAPSHOT_SEQUENCE),
+      );
+      yield* Queue.offer(harness.inputs, synchronized());
+      const live = yield* awaitThreadState(
+        harness.observed,
+        (value) => value.status === "live" && Option.isSome(value.data),
+      );
+
+      expect(yield* Ref.get(harness.lastSubscribeAfterSequence)).toBeUndefined();
+      expect(Option.getOrThrow(live.data).subagents.map((subagent) => subagent.status)).toEqual([
+        "completed",
+      ]);
     }),
   );
 

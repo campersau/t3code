@@ -35,6 +35,7 @@ import * as Stream from "effect/Stream";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
+import * as ProjectionMaintenance from "../orchestration-v2/ProjectionMaintenance.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ThreadCommandExecutor from "../orchestration-v2/ThreadCommandExecutor.ts";
@@ -194,6 +195,38 @@ function messageEvents(input: {
   ];
 }
 
+function historyTruncatedEvent(input: {
+  readonly threadId: ThreadId;
+  readonly at: DateTime.Utc;
+  readonly omittedMessageCount: number;
+}): OrchestrationV2DomainEvent {
+  const { threadId, at, omittedMessageCount } = input;
+  return {
+    id: EventId.make(`${IMPORT_EVENT_PREFIX}:history-truncated:${threadId}`),
+    type: "turn-item.updated",
+    threadId,
+    occurredAt: at,
+    payload: {
+      id: TurnItemId.make(`${IMPORT_EVENT_PREFIX}:history-truncated:${threadId}`),
+      threadId,
+      runId: null,
+      nodeId: null,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: 0,
+      status: "completed",
+      title: null,
+      startedAt: at,
+      completedAt: at,
+      updatedAt: at,
+      type: "system_notice",
+      message: `${omittedMessageCount} earlier ${omittedMessageCount === 1 ? "message was" : "messages were"} not imported. This thread keeps the first user message and the most recent history. The original session transcript is unchanged.`,
+    },
+  };
+}
+
 const make = Effect.gen(function* () {
   const scanner = yield* AgentSessionScanner.AgentSessionScanner;
   const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -203,6 +236,7 @@ const make = Effect.gen(function* () {
   const runtimes = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
   const registry = yield* ProviderAdapterRegistry.ProviderAdapterRegistryV2;
   const threadCommands = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+  const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
   const settingsService = yield* ServerSettings.ServerSettingsService;
   const ceiling = settingsService.managedPolicy?.limits?.maxRuntimeMode;
   const importRecentAgentThreads = Effect.fn("importRecentAgentThreadsV2")(function* (
@@ -248,13 +282,16 @@ const make = Effect.gen(function* () {
         ),
       );
     // The thread's project owns its transcripts: a linked worktree import records the worktree as cwd.
+    // A deleted thread's transcripts are not imported any more, so the scan reads them again.
     const completedSources = (yield* Effect.forEach(runtimeRows, (runtime) => {
       const imported = AgentSessionScanner.decodeImportedTranscriptPayload(
         runtime.runtimePayload,
       ).pipe(Option.flatMapNullishOr((payload) => payload.importedTranscripts));
       if (Option.isNone(imported) || imported.value.length === 0) return Effect.succeed([]);
       return orchestrator.getThreadRecords(runtime.threadId, []).pipe(
-        Effect.map(({ thread }) => (thread.projectId === input.projectId ? imported.value : [])),
+        Effect.map(({ thread }) =>
+          thread.projectId === input.projectId && thread.deletedAt === null ? imported.value : [],
+        ),
         Effect.catch((cause) =>
           isProjectionStoreThreadNotFoundError(cause.cause)
             ? Effect.succeed([])
@@ -320,9 +357,7 @@ const make = Effect.gen(function* () {
             },
             { onConflict: "ignore" },
           );
-          const existing = yield* Effect.option(
-            orchestrator.getThreadRecords(threadId, ["messages"]),
-          );
+          const existing = yield* Effect.option(orchestrator.getThreadRecords(threadId, []));
           if (Option.isSome(existing)) {
             if (existing.value.thread.projectId !== input.projectId) {
               return yield* new AgentSessionThreadProjectConflictError({
@@ -334,19 +369,50 @@ const make = Effect.gen(function* () {
             if (existing.value.thread.historyOrigin !== "v1_import") {
               return yield* new AgentSessionThreadModifiedError({ threadId });
             }
-            // A transcript can change after the import, so record it only when the
-            // thread already holds exactly its messages.
-            const stored = existing.value.messages;
-            if (
-              stored.length !== thread.messages.length ||
-              stored.some(
-                (message, index) =>
-                  message.role !== thread.messages[index]?.role ||
-                  message.text !== thread.messages[index]?.text,
-              )
-            ) {
-              return false;
-            }
+          }
+          if (Option.isSome(existing) && existing.value.thread.deletedAt === null) {
+            // A transcript can change after the import. A thread without runs holds only
+            // imported history, so it takes the changed messages; record the transcript
+            // only once the thread holds exactly its messages.
+            const current = yield* threadCommands.withLock(
+              threadId,
+              Effect.gen(function* () {
+                const { messages: stored, runs } = yield* orchestrator.getThreadRecords(threadId, [
+                  "messages",
+                  "runs",
+                ]);
+                const changed = thread.messages.flatMap((message, index) =>
+                  stored[index]?.role === message.role && stored[index]?.text === message.text
+                    ? []
+                    : messageEvents({ threadId, index, message }),
+                );
+                if (changed.length === 0 && stored.length === thread.messages.length) return true;
+                if (runs.length > 0 || stored.length > thread.messages.length) return false;
+                const events = [
+                  ...(thread.omittedMessageCount > 0
+                    ? [
+                        historyTruncatedEvent({
+                          threadId,
+                          at: existing.value.thread.createdAt,
+                          omittedMessageCount: thread.omittedMessageCount,
+                        }),
+                      ]
+                    : []),
+                  ...changed,
+                ];
+                // Import event ids name a message slot, and a slot's later revisions need their own.
+                yield* eventSink.write({
+                  events: yield* Effect.forEach(events, (event) =>
+                    Effect.map(idAllocator.allocate.event({ threadId }), (id) => ({
+                      ...event,
+                      id,
+                    })),
+                  ),
+                });
+                return true;
+              }),
+            );
+            if (!current) return false;
             yield* persistRuntime;
             yield* runtimes.recordImportedTranscript({ threadId, source });
             importedThreadIds.add(threadId);
@@ -420,59 +486,68 @@ const make = Effect.gen(function* () {
             updatedAt,
           };
 
-          const committed = yield* eventSink.write({
-            unlessNativeThreadOwned: providerThread,
-            events: [
-              {
-                id: EventId.make(`${IMPORT_EVENT_PREFIX}:thread:${threadId}:created`),
-                type: "thread.created",
+          const events: ReadonlyArray<OrchestrationV2DomainEvent> = [
+            {
+              id: EventId.make(`${IMPORT_EVENT_PREFIX}:thread:${threadId}:created`),
+              type: "thread.created",
+              threadId,
+              providerInstanceId: thread.providerInstanceId,
+              occurredAt: createdAt,
+              payload: appThread,
+            },
+            ...(thread.omittedMessageCount > 0
+              ? [
+                  historyTruncatedEvent({
+                    threadId,
+                    at: createdAt,
+                    omittedMessageCount: thread.omittedMessageCount,
+                  }),
+                ]
+              : []),
+            ...thread.messages.flatMap((message, index) =>
+              messageEvents({ threadId, index, message }),
+            ),
+            {
+              id: EventId.make(`${IMPORT_EVENT_PREFIX}:provider-thread:${providerThreadId}`),
+              type: "provider-thread.updated",
+              threadId,
+              driver,
+              providerInstanceId: thread.providerInstanceId,
+              occurredAt: updatedAt,
+              payload: providerThread,
+            },
+          ];
+          // A deleted thread comes back as its transcript alone. Finish its purge, then create
+          // it again in the tombstone: clients reload a thread whose replay holds a creation.
+          const committed = Option.isNone(existing)
+            ? yield* eventSink.write({ unlessNativeThreadOwned: providerThread, events })
+            : yield* threadCommands.withLock(
                 threadId,
-                providerInstanceId: thread.providerInstanceId,
-                occurredAt: createdAt,
-                payload: appThread,
-              },
-              ...(thread.omittedMessageCount > 0
-                ? [
-                    {
-                      id: EventId.make(`${IMPORT_EVENT_PREFIX}:history-truncated:${threadId}`),
-                      type: "turn-item.updated" as const,
-                      threadId,
-                      occurredAt: createdAt,
-                      payload: {
-                        id: TurnItemId.make(`${IMPORT_EVENT_PREFIX}:history-truncated:${threadId}`),
-                        threadId,
-                        runId: null,
-                        nodeId: null,
-                        providerThreadId: null,
-                        providerTurnId: null,
-                        nativeItemRef: null,
-                        parentItemId: null,
-                        ordinal: 0,
-                        status: "completed" as const,
-                        title: null,
-                        startedAt: createdAt,
-                        completedAt: createdAt,
-                        updatedAt: createdAt,
-                        type: "system_notice" as const,
-                        message: `${thread.omittedMessageCount} earlier ${thread.omittedMessageCount === 1 ? "message was" : "messages were"} not imported. This thread keeps the first user message and the most recent history. The original session transcript is unchanged.`,
-                      },
-                    },
-                  ]
-                : []),
-              ...thread.messages.flatMap((message, index) =>
-                messageEvents({ threadId, index, message }),
-              ),
-              {
-                id: EventId.make(`${IMPORT_EVENT_PREFIX}:provider-thread:${providerThreadId}`),
-                type: "provider-thread.updated",
-                threadId,
-                driver,
-                providerInstanceId: thread.providerInstanceId,
-                occurredAt: updatedAt,
-                payload: providerThread,
-              },
-            ],
-          });
+                Effect.gen(function* () {
+                  yield* maintenance.purgeDeletedThread(threadId);
+                  // The purge leaves a thread that a live fork still shows or that queued teardown
+                  // still reads; its title marks one that ran. That teardown works by thread id,
+                  // so it must not find the thread restored.
+                  const kept = yield* orchestrator.getThreadRecords(threadId, []);
+                  if (
+                    kept.thread.deletedAt === null ||
+                    kept.thread.title !== ProjectionMaintenance.DELETED_THREAD_TITLE
+                  ) {
+                    return null;
+                  }
+                  // The tombstone keeps the first import's creation event, and its id with it.
+                  return yield* eventSink.write({
+                    unlessNativeThreadOwned: providerThread,
+                    events: yield* Effect.forEach(events, (event) =>
+                      Effect.map(idAllocator.allocate.event({ threadId }), (id) => ({
+                        ...event,
+                        id,
+                      })),
+                    ),
+                  });
+                }),
+              );
+          if (committed === null) return false;
           if (committed.length === 0) return null;
           yield* persistRuntime;
           yield* runtimes.recordImportedTranscript({ threadId, source });

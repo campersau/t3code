@@ -796,6 +796,23 @@ describe("MessagesTimeline messages", () => {
     });
   });
 
+  it("keeps minimap marks apart in a thread with many user messages", async () => {
+    setup();
+    const entries = Array.from({ length: 400 }, (_, index) =>
+      message(`Question ${index}`, {}, `user-${index}`),
+    );
+    await using screen = await renderTimeline(entries);
+    const tops = () =>
+      [...screen.container.querySelectorAll<HTMLElement>("[data-minimap-strip]")]
+        .map((strip) => strip.getBoundingClientRect().top)
+        .sort((a, b) => a - b);
+    await vi.waitFor(() => expect(tops().length).toBeGreaterThan(1));
+    const markTops = tops();
+    const gaps = markTops.slice(1).map((top, index) => top - markTops[index]!);
+    // A mark is 2px tall; closer than 4px apart and neighbours read as one bar.
+    expect(Math.min(...gaps)).toBeGreaterThanOrEqual(4);
+  });
+
   it("keeps the minimap off the copy button when the chat lane is shifted left", async () => {
     setup();
     const pageSize = { width: window.innerWidth, height: window.innerHeight };
@@ -2964,4 +2981,34 @@ it("keeps concurrent approvals actionable outside collapsed work and restores se
   await expect
     .element(screen.getByRole("button", { name: "Open the current tab", exact: true }))
     .toBeVisible();
+});
+
+it("opens adjacent subagent previews without repeating the hover delay", async () => {
+  const entries = ["Review implementation", "Check edge cases"].map((title, index) => ({
+    kind: "event" as const,
+    id: `hover-agent-${index}`,
+    createdAt: CREATED_AT,
+    projectedItem: v2Item("subagent", {
+      id: `hover-item-${index}`,
+      subagentId: `hover-agent-${index}`,
+      title,
+      providerInstanceId: "codex",
+      driver: "codex",
+      origin: "app_owned",
+      childThreadId: `child-${index}`,
+      result: `Result for ${title}`,
+    }),
+  }));
+  await using screen = await renderTimeline(entries);
+  await screen.getByRole("button", { name: /Worked for/ }).click();
+  await screen.getByRole("button", { name: "2 subagents", exact: true }).click();
+  using _timers = fakeTimers();
+  const first = screen.getByRole("button", { name: "Open Review implementation" });
+  const second = screen.getByRole("button", { name: "Open Check edge cases" });
+  await userEvent.hover(first);
+  await act(() => vi.advanceTimersByTime(200));
+  expect(first.element()).toHaveAttribute("data-popup-open");
+  await userEvent.hover(second);
+  await act(() => vi.advanceTimersByTime(1));
+  expect(second.element()).toHaveAttribute("data-popup-open");
 });
